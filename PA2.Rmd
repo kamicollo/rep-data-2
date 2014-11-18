@@ -1,0 +1,224 @@
+---
+title: 'Reproducible Research: Assignment 2'
+author: "Aurimas R."
+output: 
+  html_document: 
+    keep_md: true
+---
+
+##Synopsis
+
+
+##Data Processing
+
+###Loading data
+
+The data for this analysis is based on U.S. National Oceanic and Atmospheric Administration's (NOAA) storm database, with data spanning from 1950 to 2011. It was aquired in 1 file and loaded for analysis.
+
+```{r, echo=TRUE, cache=TRUE}
+data <- read.csv(bzfile('repdata-data-StormData.csv.bz2'), stringsAsFactors=FALSE)
+```
+
+The data comprises the following attributes:
+
+```{r echo=TRUE}
+names(data)
+```
+
+###Processing numerical data
+
+In this paper, we will mainly focus on the numerical attributes `INJURIES`, `FATALITIES`, `CROPDMG` (crop damage) and `PROPDMG` (property damage). While no pre-processing is required for injury or fatality data, the crop and property damage data has its multipliers reported separately, in `CROPDMGEXP` and `PROPDMGEXP` fields, with some additional issues. In particular, this is the data we found in the dataset.
+
+```{r echo=TRUE}
+table(data$PROPDMGEXP)
+table(data$CROPDMGEXP)
+```
+
+To tackle this, the following approach was followed: 
+
+- all "h"/k"/"m"/"b" were assumed to represent hundreds, thousands, millions and billions respectively - all numeric values in the `_EXP` fields were assumed to use scientific notation (e.g. 10^N). In case the value field is zero, it was assumed that it should have been 1 instead (e.g. the damage is as indicated by the multiplier). This assumption was made after manually inspecting the data.
+- In all other cases, the multiplier was converted to 1 (i.e. value assumed to be in dollars). 
+
+The following function was used to perform the processing
+
+```{r echo=TRUE}
+normalize_numbers <- function(numbers, multipliers) {
+    ##let's normalize case
+    multipliers <- toupper(multipliers)
+    
+    ##conversion to billions
+    ix <- which(multipliers=="B")
+    numbers[ix] <- numbers[ix] * 1000000000
+    ##conversion to millions
+    ix <- which(multipliers=="M")
+    numbers[ix] <- numbers[ix] * 1000000
+    ##conversion to thousands
+    ix <- which(multipliers=="K")
+    numbers[ix] <- numbers[ix] * 1000
+    ##conversion to millions
+    ix <- which(multipliers=="H")
+    numbers[ix] <- numbers[ix] * 100
+    
+    ##cleanup of multipliers to leave only numeric ones
+    multipliers[which(multipliers %in% list("M", "B", "H", "K", 0, "-"))] <- ""
+    multipliers[which(!(multipliers %in% 1:9))] <- ""
+    
+    ##for cases where there is a value, multiply it with the multiplier
+    ## (assumed scientific notation)
+    ix <- which(numbers != 0 & multipliers %in% 1:9)
+    numbers[ix] <- numbers[ix] * 10^as.numeric(multipliers[ix])
+    
+    ## for all cases where there is no value, replace value with multiplier
+    ## (assumed scientific notation)
+    ix <- which(numbers == 0 & multipliers %in% 1:9)
+    numbers[ix] <- 10^as.numeric(multipliers[ix])
+    
+    ##return numbers
+    numbers
+}
+
+data$Property.Damage <- normalize_numbers(data$PROPDMG, data$PROPDMGEXP)
+data$Crop.Damage <- normalize_numbers(data$CROPDMG, data$CROPDMGEXP)
+
+```
+
+To ensure that at least the key event data is correct, we manually reviewed top 10 events by property damage value and compared the damage value indicated to the any mentions of damage in the text. References reviewed:
+
+```{r echo=TRUE}
+data$REFNUM[order(data$Property.Damage, decreasing=TRUE)[1:10]]
+```
+The following discrepancies were identified and corrected:
+
+ 1. Reference #605953 - the damage value was indicated as $115 billion, which would make it the highest in the dataset. However, the crop damage was limited to 32.5 million and the text mentions damage costs of $70 million. We believe this represents a data input error and we changed the estimate to $115 million instead.
+ 
+```{r echo=TRUE}
+ data$Property.Damage[605943] <- data$Property.Damage[605953] / 1000
+```
+ 
+ 1. Reference #187564 - the damage value was indicated as $5 billion, but the text mentions that most damage estimates were close to $50 million. The value was thus changed to $50 million.
+ 
+```{r echo=TRUE}
+ data$Property.Damage[187564] <- 50000000
+```
+
+After performing the pre-processing, the following summary statistics were obtained.
+
+```{r echo=TRUE}
+summary(data$Property.Damage)
+summary(data$Crop.Damage)
+```
+
+###Processing event types
+
+```{r echo=TRUE}
+count_unique <- length(unique(data$EVTYPE))
+```
+
+The original dataset includes `r count_unique ` event types. This is a number that cannot be used for analysis, as the results will simply be non-summarizable. Additionaly, the detailed specification used bears limited value to policy makers. As an example, these are the event types related to thunderstorms:
+
+```{r echo=TRUE}
+unique(data$EVTYPE)[grepl("Thunder",unique(data$EVTYPE),ignore.case = TRUE)]
+```
+
+Unfortunately, the NOAA does not provide any grouping of the event types. As a result, the following strategy was devised to simplify the dataset:
+
+ - simple string transformations to ease the analysis were done
+ - "TSTM" abbreviation was replaced with full word ("thunderstorm")
+ - All common adjectives were removed (high', 'extreme', 'excessive', 'unreasonable', 'unusual', 'strong', 'small', 'record', 'heavy', 'early', 'abnormal', 'non-severe').
+ - A (Levenshtein algorithm)[http://en.wikipedia.org/wiki/Levenshtein_distance] was applied to find similar event types (using distance between types of 25%). 
+ 
+The following function was used for implementation.
+
+```{r echo=TRUE}
+normalize_type <- function(types, distance=0.3, loops=1) {
+    ##normalize case
+    types <- tolower(types)
+    types <- gsub('/', ' ', types)
+    #first, let's remove unwanted adjectives. Would be good to do this with an NLP package,
+    #but I found it a bit non-intuitive to use
+    types <- removeAdjectives(types)
+    #let's also take care of TSTM abbreviation
+    types <- gsub('tstm', 'thunderstorm', types)
+    ##recode missing cases
+    types <- recode_missing(types)
+    
+    #let's use data.table to make this faster
+    library(data.table)
+    types <- data.table(types)
+    #loop k times - after each loop, the types should be coverging more and more.
+    for(k in 1:loops) {
+        #get unique list of types. Let's sort it so that shorter names get in front
+        # (e.g. HEAT is before HEAT WAVE)
+        u_types <- unique(types)
+        u_types <- u_types[order(u_types[[1]], na.last=TRUE)]
+        #str(u_types)
+        #print(nrow(u_types))
+        checked <- vector(mode="character", length=nrow(u_types))
+        pos <- 1
+        #loop through unique types
+        for (i in 1:nrow(u_types)) {
+            #print(i)
+            type = u_types[[i, 1]]
+            #let's see if this is not a "canonical type" yet
+            if (!(type %in% checked)) {
+                #find similar types using Levenshtein algorithm
+                similar = agrep(type, u_types[[1]], value=TRUE, max.distance = distance)
+                #replace all similar values with the current type (e.g. make it canonical)
+                for (j in 1:length(similar)) {
+                    #however, we should not replace already "canonized types" during this iteration
+                    if (!(similar[j] %in% checked)) {
+                        u_types[u_types == similar[j]] <- type
+                        types[types == similar[j]] <- type
+                    }
+                }
+                #add current type to canonical list
+                checked[pos] <- type
+                pos <- pos + 1
+            }
+        }
+    }
+    toupper(types[[1]])
+}
+
+#this function removes selected adjectives from the list
+removeAdjectives <- function(list) {
+    #predefined list of adjectives, determined by looking through the raw data
+    adj = c('high', 'extreme', 'excessive',
+            'unreasonable', 'unusual', 'strong', 'small', 'record',
+            'heavy', 'early', 'abnormal', 'non-severe')
+    #as gsub() does not accept a vector of replacements, we will loop through and apply 
+    #gsub for each adjective separately (e.g. replace them to nothing)
+    for (i in 1:length(adj)) {
+        list <- gsub(adj[i], '', list)
+    }
+    #finally, let's trim the names to make them nicer
+    library(stringr)
+    list <- str_trim(list)
+    list
+}
+
+recode_missing <- function(list) {
+    list[which(list == '?' | list == '')] <- NA
+    list
+}
+```
+
+```{r echo=TRUE}
+data$Event.Type <- normalize_type(data$EVTYPE)
+types <- unique(data$Event.Type)
+count <- length(types)
+```
+
+After applying the function to the dataset, the following `r count` event types remained:
+
+```{r echo=TRUE}
+sort(types)
+```
+
+Now the data is assumed to be clean enough to be used for analysis and recommendations.
+
+##Results
+
+###Harmfulness to population health
+
+###Economic consequences
